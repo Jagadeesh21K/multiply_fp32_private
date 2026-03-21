@@ -1,0 +1,3 @@
+jaggu@LAPTOP-5N58RK0O:/mnt/c/Users/jagad/my/multiply_fp32$ iverilog -g2012 -o /tmp/mult.vvp -s multiply_fp32 golden/multiply_fp32.sv
+golden/multiply_fp32.sv:203: warning: Numeric constant truncated to 2 bits.
+jaggu@LAPTOP-5N58RK0O:/mnt/c/Users/jagad/my/multiply_fp32$ 

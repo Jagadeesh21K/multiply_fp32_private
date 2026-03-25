@@ -1,13 +1,13 @@
-# fmultiplier — FP32 Multiplier (Handshake, Multi-Cycle, IEEE-754)
+# multiply_fp32 — FP32 Multiplier Specification
 
 ## Overview
-`fmultiplier` is a **multi-cycle** single-precision floating-point multiplier that accepts one operation at a time using a **valid/out_valid** handshake. Internally it runs a staged pipeline controlled by a small FSM (`counter`) and produces a 32-bit IEEE-754 binary32 result.
+Implement a synthesizable SystemVerilog module `multiply_fp32` that multiplies two IEEE-754 single-precision floating-point values and returns the result using a `valid` / `out_valid` handshake.
 
-This design currently targets:
-- **Bit-accurate results for normal FP32 numbers** (typical IEEE-754 behavior with round-to-nearest-even),
-- Deterministic latency (fixed number of cycles from `valid` to `out_valid`),
-- The design behaves as: z = a*b 
-- z, a and b are single precision 32-bit IEEE-754 numbers
+The design should behave as:
+
+- `z = a * b`
+
+where `a`, `b`, and `z` are 32-bit IEEE-754 single-precision values.
 
 ---
 
@@ -16,118 +16,63 @@ This design currently targets:
 ### Ports
 | Port | Dir | Width | Description |
 |------|-----|-------|-------------|
-| `clk`   | in | 1 | Clock |
-| `rst`   | in | 1 | Async reset (posedge) |
-| `valid` | in | 1 | **1-cycle start pulse**; accepted only when not busy |
-| `a`     |  in | 32 | Operand A (FP32 bits) |
-| `b`     | in | 32 | Operand B (FP32 bits) |
+| `clk`       | in  | 1  | Clock |
+| `rst`       | in  | 1  | Asynchronous reset (posedge) |
+| `valid`     | in  | 1  | 1-cycle start pulse |
+| `a`         | in  | 32 | Operand A (FP32 bits) |
+| `b`         | in  | 32 | Operand B (FP32 bits) |
 | `z`         | out | 32 | Result (FP32 bits) |
-| `out_valid` | out | 1 | **1-cycle pulse** when `z` is updated/valid |
-
-### Handshake contract
-- When `busy==0`, a high `valid` on a rising edge **starts** an operation:
-  - `a` and `b` are **registered** into internal regs `a_r` and `b_r`.
-  - The FSM begins at `counter = 1`.
-- While `busy==1`, new `valid` pulses are **ignored**.
-- When the operation completes:
-  - `z` is updated,
-  - `out_valid` pulses high for 1 clock cycle,
-  - `busy` is cleared.
+| `out_valid` | out | 1  | 1-cycle pulse when `z` is valid |
 
 ---
 
-## Latency and Throughput
+## Handshake Behavior
 
-### Latency
-- Fixed latency of **7 stages**.
-- In this implementation the operation begins at stage `counter=1` and completes at `counter=7`.
-- `out_valid` asserts on the cycle where stage 7 packing finishes.
-
-A safe expectation for system-level timing is:
-- **`out_valid` occurs 7 clock cycles after the start edge** (the clock edge where `valid` was sampled when idle).
-
-### Throughput
-- **Not pipelined** (single-issue).
-- Max throughput is **1 result per 7 cycles** (assuming `valid` is asserted only when idle).
+- A new operation is accepted only when the unit is idle.
+- If `valid` is high on a rising clock edge while the unit is idle, the operation starts on that edge.
+- While an operation is in progress, any new `valid` pulse must be ignored.
+- Only one multiplication may be in flight at a time.
+- `out_valid` must pulse high for exactly one cycle when the result is ready.
 
 ---
 
-## Internal Data Model (IEEE-754 binary32)
-For each operand:
-- `sign` = bit 31
-- `exp`  = bits 30:23 (biased exponent)
-- `mant` = bits 22:0 (fraction)
+## Timing Requirements
 
-Internal signals:
-- `a_s, b_s, z_s`: sign bits
-- `a_e, b_e, z_e`: signed exponent in *unbiased* domain (stored as 10-bit regs, used with `$signed`)
-- `a_m, b_m, z_m`: mantissas extended to 24-bit with hidden 1 when applicable
-- `product`: 50-bit product of mantissas
-- `guard_bit`, `round_bit`, `sticky`: rounding support bits for RNE
+- The design is **not pipelined**.
+- The result must appear with a **fixed latency of 7 clock cycles** from the cycle where the request is accepted.
+- `out_valid` must assert on the cycle when the packed result is available.
 
 ---
 
-## FSM / Pipeline Stages
+## Arithmetic Requirements
 
-The FSM is controlled by:
-- `busy` (operation in progress)
-- `counter` (stage number 1..7)
-
-All stage actions are performed inside a single sequential always block using `case(counter)`.
-
-### Stage 1 — Unpack
-- Extract mantissas into 24-bit regs (initially `{1'b0, frac}`).
-- Convert biased exponent into unbiased form: `exp - 127`.
-- Capture signs.
-
-### Stage 2 — Special classification + denormal setup
-- Checks operand classes using `a_is_nan`, `a_is_inf`, `a_is_zero`, etc. (derived from `a_r/b_r` fields).
-- For normal operation:
-  - If exponent is nonzero => sets implicit leading 1: `a_m[23] = 1`.
-  - If exponent is zero (subnormal) => forces exponent to -126 (subnormal exponent baseline).
-
-> If you restrict inputs to **normal numbers only**, then:
-> - `expA` and `expB` are always 1..254,
-> - hidden-one insertion always happens,
-> - special logic is bypassed in practice.
-
-### Stage 3 — Input normalization (lightweight)
-- If mantissa MSB is not set, shift left and decrement exponent.
-- This is mainly relevant for denormal handling; for strictly normal inputs, this typically does nothing.
-
-### Stage 4 — Multiply core
-- Compute result sign: `z_s = a_s ^ b_s`
-- Exponent add: `z_e = a_e + b_e + 1`
-- Mantissa product: `product = a_m * b_m * 4`
-  - The `*4` scaling aligns the product for extraction into `{z_m, G, R, S}`.
-
-### Stage 5 — Extract mantissa + rounding bits
-- `z_m = product[49:26]`
-- `guard_bit = product[25]`
-- `round_bit = product[24]`
-- `sticky = OR(product[23:0])`
-
-### Stage 6 — Normalize + Round-to-Nearest-Even (RNE)
-Normalize the result mantissa and apply IEEE-754 round-to-nearest-even
-
-### Stage 7 — Pack
-- For normal path:
-  - Pack sign, biased exponent, fraction.
-  - If exponent indicates overflow -> output INF.
-  - If exponent indicates exact denorm boundary -> force exponent field to 0 (denormal/zero representation).
-- Asserts `out_valid` for one cycle and clears `busy`.
+- Inputs `a` and `b` are IEEE-754 binary32 values.
+- For this task, you may assume the evaluated inputs are **finite normal numbers**.
+- The output must be the IEEE-754 single-precision product of `a` and `b` for the evaluated cases.
+- Use standard floating-point multiplication behavior, including:
+  - sign computation
+  - exponent handling
+  - significand multiplication
+  - normalization
+  - **round-to-nearest-even**
 
 ---
 
-## Assumptions & Constraints
-- Inputs: `exp ∈ [1..254]` (no zeros/subnormals, no inf/nan)
+## Constraints
+
+- Keep the module name exactly as `multiply_fp32`.
+- The implementation must be placed in `sources/multiply_fp32.sv`.
+- Do not change any module ports.
+- The RTL must be synthesizable.
+- The test environment uses **Icarus Verilog**, so avoid SystemVerilog Assertion (SVA) property/sequence syntax.
 
 ---
 
 ## Verification Notes
-Recommended testbench behavior for this handshake design:
-- Drive `a/b` and pulse `valid` **synchronously** on clock edges.
-- Wait for `out_valid` before sampling `z`.
-- Generate only normal operands,
 
----
+A correct implementation should support the following observable behavior:
+
+- synchronous request acceptance using `valid`
+- fixed 7-cycle response timing
+- correct handling of the busy / ignore-new-valid behavior
+- correct IEEE-754 multiplication result for the evaluated normal input cases
